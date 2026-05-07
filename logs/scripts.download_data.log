@@ -1,0 +1,22 @@
+2026-05-07 21:16:05,062 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:16:05,202 - scripts.download_data - WARNING - No data fetched.
+2026-05-07 21:18:11,186 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:18:32,992 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:18:33,085 - scripts.download_data - WARNING - No data fetched.
+2026-05-07 21:24:35,112 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:24:35,454 - scripts.download_data - ERROR - Failed to fetch data after 5 attempts.
+2026-05-07 21:24:35,455 - scripts.download_data - WARNING - No data fetched.
+2026-05-07 21:25:50,603 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:25:50,955 - scripts.download_data - ERROR - Failed to fetch data after 5 attempts.
+2026-05-07 21:25:50,955 - scripts.download_data - WARNING - No data fetched.
+2026-05-07 21:26:18,761 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:26:19,111 - scripts.download_data - ERROR - Failed to fetch data after 5 attempts.
+2026-05-07 21:26:19,111 - scripts.download_data - WARNING - No data fetched.
+2026-05-07 21:32:47,444 - scripts.download_data - WARNING - No existing data. Running full download.
+2026-05-07 21:32:47,517 - scripts.download_data - WARNING - Failed to fetch data. Retrying in 0s
+2026-05-07 21:32:47,579 - scripts.download_data - WARNING - Failed to fetch data. Retrying in 5s
+2026-05-07 21:32:52,641 - scripts.download_data - WARNING - Failed to fetch data. Retrying in 10s
+2026-05-07 21:33:02,714 - scripts.download_data - WARNING - Failed to fetch data. Retrying in 15s
+2026-05-07 21:33:17,787 - scripts.download_data - WARNING - Failed to fetch data. Retrying in 20s
+2026-05-07 21:33:37,788 - scripts.download_data - ERROR - Failed to fetch data after 5 attempts.
+2026-05-07 21:33:37,788 - scripts.download_data - WARNING - No data fetched.
