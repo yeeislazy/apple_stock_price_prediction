@@ -99,15 +99,17 @@ class EarlyStopping:
         return self.early_stop
     
 class StockPriceDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, feature_columns, target_columns,scaler, seq_len=30):
+    def __init__(self, df: pd.DataFrame, feature_columns, target_columns,features_scaler, seq_len=30,targets_scaler=None):
         self.df = df
         self.feature_columns = feature_columns
         self.target_columns = target_columns
-        self.scaler = scaler
+        self.features_scaler = features_scaler
+        self.targets_scaler = targets_scaler
         self.seq_len = seq_len
         
         # scale the features using the provided scaler
-        self.scaled_features = self.scaler.transform(self.df[self.feature_columns])
+        self.scaled_features = self.features_scaler.transform(self.df[self.feature_columns])
+        self.scaled_targets = self.targets_scaler.transform(self.df[self.target_columns]) if self.targets_scaler is not None else self.df[self.target_columns].values
 
     def __len__(self):
         return len(self.df) - self.seq_len + 1
@@ -116,18 +118,19 @@ class StockPriceDataset(Dataset):
         # Get the sequence of features
         seq = self.scaled_features[idx:idx + self.seq_len]
         # Get the target value
-        target = self.df[self.target_columns].iloc[idx + self.seq_len - 1]
+        target = self.scaled_targets[idx + self.seq_len - 1]
         
         # Convert to tensors (make copies to avoid non-writable array warning)
         seq = torch.FloatTensor(seq.copy())
-        target = torch.FloatTensor(target.values.copy())
+        target = torch.FloatTensor(target.copy())
         return seq, target
 
 
 # package the LSTM model and the scaler into a single MLflow pyfunc model
 class LSTMWithScalerWrapper(mlflow.pyfunc.PythonModel):
-    def __init__(self, scaler,feature_columns,output_size, projection_size=32, hidden_size=128, num_layers=2, seq_len=30):
-        self.scaler = scaler
+    def __init__(self, features_scaler, feature_columns, output_size, projection_size=32, hidden_size=128, num_layers=2, seq_len=30, targets_scaler=None):
+        self.features_scaler = features_scaler
+        self.targets_scaler = targets_scaler
         self.feature_columns = feature_columns
         self.seq_len = seq_len
         self.model = None
@@ -136,6 +139,8 @@ class LSTMWithScalerWrapper(mlflow.pyfunc.PythonModel):
         self.projection_size = projection_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def load_context(self, context):
         # load the model state dict from the artifact path
@@ -144,11 +149,10 @@ class LSTMWithScalerWrapper(mlflow.pyfunc.PythonModel):
         # initialize the LSTM model and load the state dict
         self.model = LSTMModel(input_size=self.input_size, output_size=self.output_size, projection_size=self.projection_size, hidden_size=self.hidden_size, num_layers=self.num_layers)
         self.model.load_state_dict(model_state_dict)
+        self.model.to(self.device)
         self.model.eval()
 
-    def predict(self, context: mlflow.pyfunc.PythonModelContext , model_input: pd.DataFrame) -> list:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+    def predict(self, context: mlflow.pyfunc.PythonModelContext , model_input: pd.DataFrame) -> list:        
         # input validation: check if all required feature columns are present
         if not all(col in model_input.columns for col in self.feature_columns):
             raise ValueError(f"Missing columns. Expected: {self.feature_columns}")
@@ -161,23 +165,34 @@ class LSTMWithScalerWrapper(mlflow.pyfunc.PythonModel):
             raise ValueError(f"Input length {len(model_input)} < seq_len {self.seq_len}")
         model_input = model_input[-self.seq_len:]
         
-        scaled_input = self.scaler.transform(model_input)
+        scaled_input = self.features_scaler.transform(model_input)
         
         lstm_input_tensor = torch.FloatTensor(scaled_input).unsqueeze(0) # shape: (1, seq_len, input_size)
         
         # predict with the LSTM model
         with torch.no_grad():
-            predictions = self.model(lstm_input_tensor.to(device)).cpu().numpy()
+            predictions = self.model(lstm_input_tensor.to(self.device)).cpu().numpy()
         
-        # return the predictions as a list
+        # unscale the predictions if targets_scaler is available
+        if self.targets_scaler is not None:
+            predictions = self.targets_scaler.inverse_transform(predictions)
+            
         return predictions.tolist()
 
 
-def train_scaler(df, feature_columns) -> StandardScaler:
-    scaler = StandardScaler()
-    scaler.fit(df[feature_columns])
+def train_scaler(train_df, feature_columns, target_columns=None):
+    features_scaler = StandardScaler()
+    features_scaler.fit(train_df[feature_columns])
     
-    return scaler
+    joblib.dump(features_scaler, Path(__file__).parent.parent.parent / "artifacts" / "feature_scaler.pkl")
+    
+    if target_columns is not None:
+        targets_scaler = StandardScaler()
+        targets_scaler.fit(train_df[target_columns])
+        joblib.dump(targets_scaler, Path(__file__).parent.parent.parent / "artifacts" / "target_scaler.pkl")
+        return features_scaler, targets_scaler
+
+    return features_scaler
 
 def get_schema(df: pd.DataFrame, feature_columns, target_columns):
     schema_dict = {
@@ -204,16 +219,30 @@ def get_signature(X_train, Y_train, model, dataset_name, version):
     )
     return signature, train_ds
 
-def train_lstm(parameters,train_df,feature_columns,target_column,scaler=None,test_df=None, run_name=None, experiment_name='apple_stock_price_prediction'):  
+def train_lstm(parameters,train_df,feature_columns,target_columns,features_scaler=None,targets_scaler=None,test_df=None, run_name=None, experiment_name='apple_stock_price_prediction'):  
     exp = mlflow.set_experiment(experiment_name)
     with mlflow.start_run(run_name=run_name, experiment_id=exp.experiment_id) as run:  
         logger = get_logger(__name__)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        train_dataset = StockPriceDataset(train_df, feature_columns, target_column,scaler, seq_len=parameters["seq_len"])
+        train_dataset = StockPriceDataset(
+            df=train_df, 
+            feature_columns=feature_columns, 
+            target_columns=target_columns,
+            features_scaler=features_scaler, 
+            seq_len=parameters["seq_len"],
+            targets_scaler=targets_scaler
+        )
         train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
         
         if test_df is not None:
-            test_dataset = StockPriceDataset(test_df, feature_columns, target_column,scaler, seq_len=parameters["seq_len"])
+            test_dataset = StockPriceDataset(
+                df=test_df,
+                feature_columns=feature_columns,
+                target_columns=target_columns,
+                features_scaler=features_scaler,
+                targets_scaler=targets_scaler,
+                seq_len=parameters["seq_len"]
+            )
             test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
         
         model = LSTMModel(
@@ -236,36 +265,76 @@ def train_lstm(parameters,train_df,feature_columns,target_column,scaler=None,tes
         for epoch in range(parameters["num_epochs"]):
             model.train()
             train_loss = 0
-            val_loss = 0
+            train_targets_loss = {target: 0 for target in parameters["target_columns"]}
+            
+            # remaining weight allocation
+            weight_decay = parameters.get("weight_decay", 0.7)
+            num_targets = len(parameters["target_columns"])
+            weights = []
+            remaining_weight = 1.0
+            for i in range(num_targets-1):
+                current_weight = remaining_weight * weight_decay
+                weights.append(current_weight)
+                remaining_weight -= current_weight
+            weights.append(remaining_weight) #eg: for 3 targets with weight_decay=0.7, weights would be [0.7, 0.21, 0.09]
+
+                
+            weights = torch.tensor(parameters["target_weights"], device=device)
             
             for X_batch, Y_batch in train_dataloader:
                 X_batch = X_batch.to(device)
                 Y_batch = Y_batch.to(device)
                 
-                # optimizer.zero_grad()
+                optimizer.zero_grad()
                 outputs = model(X_batch)
-                loss = criterion(outputs, Y_batch)
-                # loss.backward()
-                # optimizer.step()
+                
+                
+                loss_per_target = (outputs - Y_batch) ** 2
+                weighted_loss = loss_per_target * weights
+                loss = weighted_loss.sum(dim=1).mean()
+                
+                loss.backward()
+                optimizer.step()
                 
                 train_loss += loss.item()
                 
+                for target in parameters["target_columns"]:
+                    target_idx = parameters["target_columns"].index(target)
+                    train_targets_loss[target] += loss_per_target[:, target_idx].mean().item()
+                
             avg_train_loss = train_loss / len(train_dataloader)
+            avg_train_targets_loss = {target: train_targets_loss[target] / len(train_dataloader) for target in parameters["target_columns"]}
+            
+            mlflow.log_metric("train_loss", avg_train_loss, step=epoch+1)
+            mlflow.log_metrics(avg_train_targets_loss, step=epoch+1)
+
                 
             if test_df is not None:
+                val_loss = 0
+                test_targets_loss = {target: 0 for target in parameters["target_columns"]}
+                model.eval()
+
                 for X_batch, Y_batch in test_dataloader:
                     X_batch = X_batch.to(device)
                     Y_batch = Y_batch.to(device)
 
-                    model.eval()
                     with torch.no_grad():
                         outputs = model(X_batch)
-                        loss = criterion(outputs, Y_batch)
+                        loss_per_target = (outputs - Y_batch) ** 2
+                        weighted_loss = loss_per_target * weights
+                        loss = weighted_loss.sum(dim=1).mean()
                         val_loss += loss.item()
+                        
+                        for target in parameters["target_columns"]:
+                            target_idx = parameters["target_columns"].index(target)
+                            test_targets_loss[target] += ((outputs[:, target_idx] - Y_batch[:, target_idx]) ** 2).mean().item()
                     
                 avg_val_loss = val_loss / len(test_dataloader)
-            else:
-                avg_val_loss = None
+                avg_test_targets_loss = {target: test_targets_loss[target] / len(test_dataloader) for target in parameters["target_columns"]}
+                
+                mlflow.log_metric("val_loss", avg_val_loss, step=epoch+1)
+                mlflow.log_metrics(avg_test_targets_loss, step=epoch+1)
+            
             
             val_loss_str = f"{avg_val_loss:.4f}" if avg_val_loss is not None else "N/A"
             logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss_str}")
@@ -274,19 +343,22 @@ def train_lstm(parameters,train_df,feature_columns,target_column,scaler=None,tes
                 if early_stopping(avg_val_loss):
                     logger.info("Early stopping triggered")
                     break
-        
-            mlflow.log_metric("train_loss", avg_train_loss, step=epoch+1)
-            if avg_val_loss is not None:
-                mlflow.log_metric("val_loss", avg_val_loss, step=epoch+1)
+            else:
+                if early_stopping(avg_train_loss):
+                    logger.info("Early stopping triggered")
+                    break                
             
         # log the scaler and model as artifacts in MLflow
         with tempfile.TemporaryDirectory() as tmp_dir:
             # log the scaler as an artifact in MLflow
             start_date = train_df['date'].min().strftime("%Y%m%d")
             end_date = train_df['date'].max().strftime("%Y%m%d")
-            scaler_path = Path(tmp_dir) / f"std_{start_date}_{end_date}.pkl"
-            joblib.dump(scaler, scaler_path)
-            mlflow.log_artifact(scaler_path, artifact_path="preprocessor")
+            features_scaler_path = Path(tmp_dir) / f"features_stdscaler_{start_date}_{end_date}.pkl"
+            targets_scaler_path = Path(tmp_dir) / f"targets_stdscaler_{start_date}_{end_date}.pkl"
+            joblib.dump(features_scaler, features_scaler_path)
+            joblib.dump(targets_scaler, targets_scaler_path)
+            mlflow.log_artifact(features_scaler_path, artifact_path="preprocessor")
+            mlflow.log_artifact(targets_scaler_path, artifact_path="preprocessor")
             
             ### log model to mlflow
             # save the model state dict to a temporary file
@@ -295,19 +367,25 @@ def train_lstm(parameters,train_df,feature_columns,target_column,scaler=None,tes
             
             artifacts = {
                 "model_state": model_path,
-                "scaler": scaler_path
+                "features_scaler": features_scaler_path,
+                "targets_scaler": targets_scaler_path
             }
             print(X_batch.cpu()[0,:,:].unsqueeze(0).numpy().shape)
             print(Y_batch.cpu()[0,:].unsqueeze(0).numpy().shape)
             signature = infer_signature(
-                model_input=X_batch.cpu()[0,:,:].unsqueeze(0).numpy(),
-                model_output = Y_batch.cpu()[0,:].unsqueeze(0).numpy()
+                model_input=train_df[feature_columns].iloc[-parameters["seq_len"]:],
+                model_output=train_df[parameters["target_columns"]].iloc[-1:].values
             )
             
             try:
                 model_info = mlflow.pyfunc.log_model(
                     artifact_path="lstm_model",
-                    python_model=LSTMWithScalerWrapper(scaler,feature_columns,parameters["output_size"], parameters["projection_size"], parameters["hidden_size"], parameters["num_layers"], parameters["seq_len"]),
+                    python_model=LSTMWithScalerWrapper(
+                        features_scaler= features_scaler,feature_columns=feature_columns,
+                        output_size=parameters["output_size"], projection_size=parameters["projection_size"], hidden_size=parameters["hidden_size"], num_layers=parameters["num_layers"], 
+                        seq_len=parameters["seq_len"],
+                        targets_scaler=targets_scaler
+                        ),
                     artifacts=artifacts,
                     signature=signature)
             except Exception as e:
@@ -316,12 +394,12 @@ def train_lstm(parameters,train_df,feature_columns,target_column,scaler=None,tes
             
             
         #log schema
-        schema = get_schema(train_df, feature_columns, target_column)
+        schema = get_schema(train_df, feature_columns, parameters["target_columns"])
         mlflow.log_dict(schema, "schema.json")
         
         #log the training dataset as an MLflow artifact
         train_ds = mlflow.data.from_pandas(
-            train_df[feature_columns + target_column],
+            train_df[feature_columns + parameters["target_columns"]],
             name=f"aapl_train_dataset_{start_date}_{end_date}"
         )
         mlflow.log_input(train_ds, context="training")
@@ -340,17 +418,19 @@ def main():
     start_date = train_df['date'].min().strftime("%Y%m%d")
     end_date = train_df['date'].max().strftime("%Y%m%d")
 
+    
     parameters = {
         "model": "lstm_model",
         "input_size": len(feature_columns),
         "feature_columns": feature_columns,
         "target_columns": target_column,
+        "weight_decay": 0.7,
         "output_size": len(target_column),
         "projection_size": 32,
         "hidden_size": 128,
         "num_layers": 2,
         "seq_len": 30,
-        "num_epochs": 1,
+        "num_epochs": 100,
         "lr": 1e-4,
         "data_period": f"{start_date}-{end_date}",
         "scaler": None,
